@@ -1,0 +1,15 @@
+# Custom additions
+.env
+truenas-sentiment-analysis/
+Account-Analysis-Reports/
+outputs/
+*.xlsx
+!tests/fixtures/*.xlsx
+.DS_Store
+.vscode/
+.idea/
+*.swp
+.claudecode
+__pycache__/
+*.pyc
+venv/

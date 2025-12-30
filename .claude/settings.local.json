@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venvScriptspython.exe -m src.cli analyze \"C:\\\\Users\\\\cam\\\\OneDrive\\\\Desktop\\\\AI Projects\\\\Account-Analysis-Reports\\\\Account  AI Email Body-2025-12-23-13-34-34.xlsx\")",
+      "Bash(./venv/Scripts/python.exe -m src.cli analyze:*)",
+      "Bash(./venv/Scripts/python.exe -m src.cli dashboard:*)",
+      "Bash(tree:*)",
+      "Bash(./venv/Scripts/python.exe:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push)",
+      "Bash(mkdir:*)",
+      "Bash(git init:*)",
+      "Bash(git remote:*)"
+    ]
+  }
+}

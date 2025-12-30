@@ -1,0 +1,390 @@
+"""
+Main orchestration for TrueNAS Sentiment Analysis.
+Local deployment version - adapted from Abacus AI workflow.
+
+This module coordinates the full analysis pipeline:
+1. Load and prepare data from Excel
+2. Run Claude 3.5 Haiku analysis on all cases
+3. Calculate criticality scores
+4. Run Claude 3.5 Sonnet quick scoring and detailed timelines
+5. Generate visualizations
+6. Save outputs (charts, JSON, PDF report)
+"""
+
+import json
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Optional, Dict, Any
+
+import numpy as np
+
+from .core import (
+    Config,
+    console,
+    print_header,
+    print_stage,
+    print_success,
+    print_error,
+    print_health_score,
+    streaming_output,
+)
+from .analysis import (
+    load_and_prepare_data,
+    detect_and_merge_case_relationships,
+    run_claude_analysis,
+    run_deepseek_quick_scoring,
+    run_deepseek_detailed_timeline,
+    calculate_criticality_scores,
+    calculate_account_health_score,
+    analyze_asset_correlations,
+    build_account_intelligence_brief,
+    DEFAULT_ANALYSIS_CONTEXT,
+)
+from .visualization import generate_all_charts
+from .context import (
+    load_context_for_case,
+    get_product_line_from_serial,
+    get_product_line_from_series,
+    get_product_line_from_model,
+)
+
+
+def build_enhanced_context(df, client=None) -> tuple:
+    """
+    Build enhanced analysis context from loaded data.
+
+    Detects product line from Product Series or Product Model columns and loads:
+    - Global context (SLA, always-load docs)
+    - Product-specific documentation
+
+    Args:
+        df: DataFrame with case data containing Product Series or Product Model columns
+        client: Optional streaming output client for progress messages
+
+    Returns:
+        Tuple of (enhanced_context_string, detected_product_line)
+    """
+    if client is None:
+        client = streaming_output
+
+    detected_products = set()
+
+    # Primary method: Use Product Series column (e.g., 'F', 'M', 'H', 'R')
+    if "Product Series" in df.columns:
+        series_values = df["Product Series"].dropna().unique().tolist()
+        for series in series_values:
+            product = get_product_line_from_series(str(series))
+            if product:
+                detected_products.add(product)
+
+    # Fallback: Use Product Model column (e.g., 'F100-HA', 'M50')
+    if not detected_products and "Product Model" in df.columns:
+        model_values = df["Product Model"].dropna().unique().tolist()
+        for model in model_values:
+            product = get_product_line_from_model(str(model))
+            if product:
+                detected_products.add(product)
+
+    # Last resort: Use Asset Serial column
+    if not detected_products and "Asset Serial" in df.columns:
+        serial_values = df["Asset Serial"].dropna().unique().tolist()
+        for serial in serial_values:
+            product = get_product_line_from_serial(str(serial))
+            if product:
+                detected_products.add(product)
+
+    # Use first detected product (most common case: single product per account)
+    primary_product = list(detected_products)[0] if detected_products else None
+
+    if primary_product:
+        client.stream_message(f"  Detected product line: {primary_product}")
+        if len(detected_products) > 1:
+            client.stream_message(f"  Note: Multiple products detected: {', '.join(detected_products)}")
+
+    # Load context (SLA + product-specific docs)
+    loaded_context, product_line = load_context_for_case(
+        product_line=primary_product
+    )
+
+    # Combine with default analysis context
+    if loaded_context:
+        enhanced_context = DEFAULT_ANALYSIS_CONTEXT + "\n\n" + loaded_context
+        client.stream_message(f"  Loaded {len(loaded_context):,} chars of product documentation")
+    else:
+        enhanced_context = DEFAULT_ANALYSIS_CONTEXT
+        client.stream_message("  Using default context (no product docs loaded)")
+
+    return enhanced_context, product_line
+
+
+def run_analysis(
+    input_file: str,
+    output_dir: Optional[str] = None,
+    analysis_context: Optional[str] = None,
+    skip_sonnet: bool = False,
+) -> Dict[str, Any]:
+    """
+    Run the complete sentiment analysis pipeline.
+
+    Args:
+        input_file: Path to Excel file with case data
+        output_dir: Output directory (default: outputs/)
+        analysis_context: Custom analysis context (default: TrueNAS context)
+        skip_sonnet: If True, skip Sonnet analysis (faster, cheaper)
+
+    Returns:
+        Dictionary with analysis results and paths to output files
+    """
+    # Validate configuration
+    errors = Config.validate()
+    if errors:
+        for error in errors:
+            print_error(error)
+        raise ValueError("Configuration validation failed")
+
+    # Setup directories
+    Config.ensure_directories()
+
+    if output_dir:
+        output_path = Path(output_dir)
+    else:
+        output_path = Config.OUTPUT_DIR
+
+    # Note: analysis_context is now built after data loading if not provided,
+    # using build_enhanced_context() which loads SLA + product-specific docs
+
+    # Create timestamped output folder
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_output_dir = output_path / f"analysis_{timestamp}"
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+
+    charts_dir = run_output_dir / "charts"
+    json_dir = run_output_dir / "json"
+    reports_dir = run_output_dir / "reports"
+
+    charts_dir.mkdir(exist_ok=True)
+    json_dir.mkdir(exist_ok=True)
+    reports_dir.mkdir(exist_ok=True)
+
+    print_header(
+        "TrueNAS Customer Sentiment Analysis",
+        f"Input: {input_file}"
+    )
+
+    start_time = time.time()
+    client = streaming_output
+
+    try:
+        # STAGE 1: Load and prepare data
+        print_stage(1, "DATA LOADING", "Loading Excel file and preparing data")
+        df, current_date = load_and_prepare_data(input_file, client)
+
+        # STAGE 1.5: Detect and merge duplicates
+        df = detect_and_merge_case_relationships(df, client)
+
+        # STAGE 1.6: Load context documentation
+        if analysis_context is None:
+            print_stage(2, "CONTEXT LOADING", "Loading SLA and product documentation")
+            analysis_context, detected_product = build_enhanced_context(df, client)
+        else:
+            detected_product = None
+            client.stream_message("  Using custom analysis context provided")
+
+        # STAGE 2: Claude Haiku analysis
+        print_stage(3, "CLAUDE 3.5 HAIKU ANALYSIS", "Analyzing all cases for frustration patterns")
+        (case_analysis, claude_statistics, issue_categories,
+         support_level_distribution, claude_time) = run_claude_analysis(
+            df, analysis_context, client
+        )
+
+        # STAGE 4: Criticality scoring
+        print_stage(4, "CRITICALITY SCORING", "Calculating priority scores")
+        case_analysis = calculate_criticality_scores(case_analysis, client)
+
+        # Initialize Sonnet statistics
+        deepseek_statistics = {
+            "total_scored": 0,
+            "total_analyzed": 0,
+            "api_errors": 0,
+            "quick_scoring_time": 0,
+            "detailed_timeline_time": 0,
+            "analysis_time_seconds": 0,
+        }
+        deepseek_time = 0
+
+        if not skip_sonnet:
+            # Build account brief for quick scoring
+            account_brief_light = build_account_intelligence_brief(
+                case_analysis, asset_correlations=None, mode='light'
+            )
+
+            # STAGE 5: Claude Sonnet quick scoring
+            print_stage(5, "CLAUDE 3.5 SONNET - QUICK SCORING", "Pattern analysis on top cases")
+            quick_stats, quick_time = run_deepseek_quick_scoring(
+                case_analysis, analysis_context, client, account_brief_light
+            )
+            deepseek_statistics.update(quick_stats)
+            deepseek_statistics["quick_scoring_time"] = quick_time
+
+            # Recalculate scores with Sonnet data
+            case_analysis = calculate_criticality_scores(case_analysis, client)
+
+            # STAGE 6: Asset correlation
+            print_stage(6, "ASSET CORRELATION", "Analyzing hardware patterns")
+            asset_correlations = analyze_asset_correlations(case_analysis, client)
+
+            # Build full account brief
+            account_brief_full = build_account_intelligence_brief(
+                case_analysis, asset_correlations, mode='full'
+            )
+
+            # STAGE 7: Claude Sonnet detailed timelines
+            print_stage(7, "CLAUDE 3.5 SONNET - DETAILED TIMELINES", "Building interaction timelines")
+            timeline_stats, timeline_time = run_deepseek_detailed_timeline(
+                case_analysis, analysis_context, client, account_brief_full, asset_correlations
+            )
+            deepseek_statistics["total_analyzed"] = timeline_stats["total_analyzed"]
+            deepseek_statistics["api_errors"] += timeline_stats["api_errors"]
+            deepseek_statistics["detailed_timeline_time"] = timeline_time
+            deepseek_statistics["analysis_time_seconds"] = quick_time + timeline_time
+            deepseek_time = quick_time + timeline_time
+        else:
+            asset_correlations = analyze_asset_correlations(case_analysis, client)
+
+        # STAGE 8: Generate visualizations
+        print_stage(8 if not skip_sonnet else 6, "VISUALIZATION", "Generating charts")
+
+        severity_distribution = {}
+        for case in case_analysis:
+            sev = case["severity"]
+            severity_distribution[sev] = severity_distribution.get(sev, 0) + 1
+
+        charts = generate_all_charts(
+            case_analysis,
+            claude_statistics,
+            issue_categories,
+            severity_distribution,
+            support_level_distribution
+        )
+
+        # Save charts
+        for chart_name, chart_bytes in charts.items():
+            chart_path = charts_dir / f"{chart_name}.png"
+            with open(chart_path, 'wb') as f:
+                f.write(chart_bytes)
+            client.stream_message(f"  Saved: {chart_path.name}")
+
+        # STAGE 6: Calculate account health
+        customer_name = case_analysis[0]['customer_name'] if case_analysis else "Unknown"
+        health_score, score_breakdown = calculate_account_health_score(
+            case_analysis, claude_statistics
+        )
+
+        total_time = time.time() - start_time
+
+        # Print summary
+        print_health_score(health_score, customer_name)
+
+        # STAGE 9: Save JSON outputs
+        print_stage(9 if not skip_sonnet else 7, "SAVING OUTPUTS", "Writing JSON and preparing report")
+
+        def clean_for_json(case_list):
+            """Remove non-serializable data from cases."""
+            cleaned = []
+            for case in case_list:
+                case_copy = case.copy()
+                case_copy.pop('case_data', None)
+                case_copy.pop('messages_full', None)
+                cleaned.append(case_copy)
+            return cleaned
+
+        # Summary statistics
+        summary_stats = {
+            "analysis_date": current_date.strftime("%Y-%m-%d"),
+            "account_name": customer_name,
+            "account_health_score": round(health_score, 1),
+            "total_cases": len(case_analysis),
+            "analysis_time_seconds": round(total_time, 1),
+            "claude_haiku_time": round(claude_time, 1),
+            "claude_sonnet_time": round(deepseek_time, 1),
+            "severity_distribution": severity_distribution,
+            "support_level_distribution": support_level_distribution,
+            "claude_statistics": claude_statistics,
+            "deepseek_statistics": deepseek_statistics,
+            "score_breakdown": score_breakdown,
+        }
+
+        with open(json_dir / "summary_statistics.json", 'w') as f:
+            json.dump(summary_stats, f, indent=2, default=str)
+
+        # Top 25 cases
+        top_25 = case_analysis[:25]
+        top_25_data = {
+            "analysis_date": current_date.strftime("%Y-%m-%d"),
+            "account_name": customer_name,
+            "methodology": "Hybrid: Claude 3.5 Haiku + Claude 3.5 Sonnet",
+            "cases": clean_for_json(top_25),
+        }
+
+        with open(json_dir / "top_25_critical_cases.json", 'w') as f:
+            json.dump(top_25_data, f, indent=2, default=str)
+
+        # All cases (condensed)
+        all_cases_data = {
+            "analysis_date": current_date.strftime("%Y-%m-%d"),
+            "account_name": customer_name,
+            "total_cases": len(case_analysis),
+            "cases": [
+                {
+                    "case_number": c["case_number"],
+                    "criticality_score": c["criticality_score"],
+                    "frustration_score": c["claude_analysis"]["frustration_score"],
+                    "severity": c["severity"],
+                    "status": c["status"],
+                    "age_days": c["case_age_days"],
+                }
+                for c in case_analysis
+            ]
+        }
+
+        with open(json_dir / "all_cases.json", 'w') as f:
+            json.dump(all_cases_data, f, indent=2, default=str)
+
+        client.stream_message(f"  Saved: summary_statistics.json")
+        client.stream_message(f"  Saved: top_25_critical_cases.json")
+        client.stream_message(f"  Saved: all_cases.json")
+
+        # Final summary
+        console.print()
+        console.print(f"[bold green]Analysis complete![/bold green]")
+        console.print(f"  Total time: {total_time:.1f}s")
+        console.print(f"  Output directory: {run_output_dir}")
+        console.print()
+
+        return {
+            "success": True,
+            "output_dir": str(run_output_dir),
+            "customer_name": customer_name,
+            "health_score": health_score,
+            "total_cases": len(case_analysis),
+            "critical_cases": len([c for c in case_analysis if c['criticality_score'] >= 180]),
+            "analysis_time": total_time,
+            "charts": charts,
+            "case_analysis": case_analysis,
+            "statistics": {
+                "claude": claude_statistics,
+                "sonnet": deepseek_statistics,
+            },
+            "asset_correlations": asset_correlations,
+        }
+
+    except Exception as e:
+        print_error(f"Analysis failed: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+        return {
+            "success": False,
+            "error": str(e),
+        }
