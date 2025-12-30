@@ -173,11 +173,18 @@ class SupportCase:
     messages: List[str] = field(default_factory=list)
     from_addresses: List[str] = field(default_factory=list)
 
-    # Analysis results (populated later)
+    # Analysis results (populated later by analysis layers)
     is_repeat_issue: bool = False
     repeat_of_case: Optional[str] = None
     criticality_score: int = 0
     frustration_score: float = 0.0
+
+    # Issue classification (populated by support_layer)
+    is_hardware_failure: bool = False
+    is_performance_issue: bool = False
+    is_configuration_issue: bool = False
+    escalation_detected: bool = False
+    deployment_related: Optional[bool] = None  # If linked to deployment issues
 
 
 @dataclass
@@ -200,6 +207,11 @@ class LinkedOrder:
     journey_health_score: int = 0  # 0-100
     expectation_match: Optional[str] = None  # How well deployment matched expectations
     churn_risk: str = "Unknown"  # Low/Medium/High/Critical
+
+    # Insights from evaluation layer
+    critical_findings: List[str] = field(default_factory=list)
+    positive_signals: List[str] = field(default_factory=list)
+    immediate_actions: List[str] = field(default_factory=list)
 
     @property
     def has_opportunity(self) -> bool:
