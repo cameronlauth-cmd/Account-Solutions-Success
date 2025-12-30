@@ -20,14 +20,18 @@ from src.dashboard.styles import get_global_css
 
 
 def get_available_analyses():
-    """Get list of available analysis folders."""
+    """Get list of available analysis folders (both single and full analysis)."""
     outputs_dir = Config.OUTPUT_DIR
     if not outputs_dir.exists():
         return []
 
     analyses = []
     for folder in sorted(outputs_dir.iterdir(), reverse=True):
-        if folder.is_dir() and folder.name.startswith("analysis_"):
+        if not folder.is_dir():
+            continue
+
+        # Handle traditional single-source analysis
+        if folder.name.startswith("analysis_"):
             summary_file = folder / "json" / "summary_statistics.json"
             if summary_file.exists():
                 try:
@@ -40,35 +44,120 @@ def get_available_analyses():
                         "date": data.get("analysis_date", "Unknown"),
                         "health_score": data.get("account_health_score", 0),
                         "total_cases": data.get("total_cases", 0),
+                        "analysis_type": "single",
                     })
                 except Exception:
                     pass
+
+        # Handle full multi-source analysis
+        elif folder.name.startswith("full_analysis_"):
+            link_summary_file = folder / "json" / "link_summary.json"
+            account_metrics_file = folder / "json" / "account_metrics.json"
+            if link_summary_file.exists():
+                try:
+                    with open(link_summary_file) as f:
+                        link_data = json.load(f)
+
+                    # Try to get account name from account metrics
+                    account_name = "Multi-Account"
+                    if account_metrics_file.exists():
+                        with open(account_metrics_file) as f:
+                            acct_data = json.load(f)
+                            accounts = acct_data.get("accounts", {})
+                            if accounts:
+                                # Get first account name
+                                if isinstance(accounts, dict):
+                                    account_name = list(accounts.keys())[0]
+                                elif isinstance(accounts, list) and accounts:
+                                    account_name = accounts[0].get("account_name", "Multi-Account")
+
+                    # Extract timestamp from folder name
+                    timestamp = folder.name.replace("full_analysis_", "")
+                    date_str = f"{timestamp[:4]}-{timestamp[4:6]}-{timestamp[6:8]}"
+
+                    analyses.append({
+                        "folder": folder,
+                        "name": folder.name,
+                        "account": account_name,
+                        "date": date_str,
+                        "health_score": 0,  # Will show linked orders instead
+                        "total_cases": link_data.get("total_cases", 0),
+                        "total_orders": link_data.get("total_orders", 0),
+                        "fully_linked": link_data.get("fully_linked_orders", 0),
+                        "analysis_type": "full",
+                    })
+                except Exception:
+                    pass
+
     return analyses
 
 
 def load_analysis_data(folder: Path):
-    """Load all analysis data from a folder."""
+    """Load all analysis data from a folder (single or full analysis)."""
     data = {}
 
-    # Load summary statistics
-    summary_file = folder / "json" / "summary_statistics.json"
-    if summary_file.exists():
-        with open(summary_file) as f:
-            data["summary"] = json.load(f)
+    # Determine analysis type
+    is_full = folder.name.startswith("full_analysis_")
+    data["analysis_type"] = "full" if is_full else "single"
 
-    # Load top 25 cases
-    cases_file = folder / "json" / "top_25_critical_cases.json"
-    if cases_file.exists():
-        with open(cases_file) as f:
-            data["cases"] = json.load(f)
+    json_dir = folder / "json"
 
-    # Load all cases
-    all_cases_file = folder / "json" / "all_cases.json"
-    if all_cases_file.exists():
-        with open(all_cases_file) as f:
-            data["all_cases"] = json.load(f)
+    if is_full:
+        # Load full analysis data
+        files_to_load = {
+            "link_summary": "link_summary.json",
+            "opportunities": "opportunities.json",
+            "deployments": "deployments.json",
+            "support_cases": "support_cases.json",
+            "cross_layer_insights": "cross_layer_insights.json",
+            "product_metrics": "product_metrics.json",
+            "account_metrics": "account_metrics.json",
+            "usecase_metrics": "usecase_metrics.json",
+            "service_metrics": "service_metrics.json",
+        }
 
-    # Get chart paths
+        for key, filename in files_to_load.items():
+            filepath = json_dir / filename
+            if filepath.exists():
+                with open(filepath) as f:
+                    data[key] = json.load(f)
+
+        # Create a summary-like object for compatibility with existing pages
+        if "link_summary" in data:
+            ls = data["link_summary"]
+            data["summary"] = {
+                "total_cases": ls.get("total_cases", 0),
+                "total_orders": ls.get("total_orders", 0),
+                "fully_linked_orders": ls.get("fully_linked_orders", 0),
+                "total_opportunities": ls.get("total_opportunities", 0),
+                "total_deployments": ls.get("total_deployments", 0),
+            }
+            # Try to get account name
+            if "account_metrics" in data:
+                accounts = data["account_metrics"].get("accounts", {})
+                if isinstance(accounts, dict) and accounts:
+                    data["summary"]["account_name"] = list(accounts.keys())[0]
+                elif isinstance(accounts, list) and accounts:
+                    data["summary"]["account_name"] = accounts[0].get("account_name", "Multi-Account")
+
+    else:
+        # Load traditional single-source analysis data
+        summary_file = json_dir / "summary_statistics.json"
+        if summary_file.exists():
+            with open(summary_file) as f:
+                data["summary"] = json.load(f)
+
+        cases_file = json_dir / "top_25_critical_cases.json"
+        if cases_file.exists():
+            with open(cases_file) as f:
+                data["cases"] = json.load(f)
+
+        all_cases_file = json_dir / "all_cases.json"
+        if all_cases_file.exists():
+            with open(all_cases_file) as f:
+                data["all_cases"] = json.load(f)
+
+    # Get chart paths (both types may have charts)
     charts_dir = folder / "charts"
     if charts_dir.exists():
         data["charts"] = {
@@ -174,38 +263,86 @@ def run_analysis_with_progress(file_path: Path, skip_sonnet: bool) -> tuple:
 
 def render_analysis_card(analysis: dict, index: int):
     """Render a card for an existing analysis."""
-    health = analysis['health_score']
-    health_color = get_health_color(health)
-    health_status = get_health_status(health)
+    is_full = analysis.get("analysis_type") == "full"
 
-    st.markdown(f"""
-    <div style="background: {COLORS['surface']}; padding: 1rem; border-radius: 8px;
-                border-left: 3px solid {health_color}; margin-bottom: 0.75rem;">
-        <div style="display: flex; justify-content: space-between; align-items: flex-start;">
-            <div>
-                <div style="color: {COLORS['white']}; font-weight: 600; font-size: 1.1rem;">
-                    {analysis['account']}
+    if is_full:
+        # Full analysis card - show linked orders instead of health score
+        total_orders = analysis.get('total_orders', 0)
+        fully_linked = analysis.get('fully_linked', 0)
+        link_pct = (fully_linked / total_orders * 100) if total_orders > 0 else 0
+
+        # Color based on link percentage
+        if link_pct >= 50:
+            card_color = COLORS['success']
+        elif link_pct >= 25:
+            card_color = COLORS['warning']
+        else:
+            card_color = COLORS['primary']
+
+        st.markdown(f"""
+        <div style="background: {COLORS['surface']}; padding: 1rem; border-radius: 8px;
+                    border-left: 3px solid {card_color}; margin-bottom: 0.75rem;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                <div>
+                    <div style="color: {COLORS['white']}; font-weight: 600; font-size: 1.1rem;">
+                        {analysis['account']}
+                        <span style="background: {COLORS['primary']}; color: white; padding: 2px 8px;
+                                     border-radius: 4px; font-size: 0.7rem; margin-left: 8px;">FULL</span>
+                    </div>
+                    <div style="color: {COLORS['text_muted']}; font-size: 0.85rem; margin-top: 0.25rem;">
+                        {analysis['date']} &bull; {analysis['total_cases']} cases &bull; {total_orders} orders
+                    </div>
                 </div>
-                <div style="color: {COLORS['text_muted']}; font-size: 0.85rem; margin-top: 0.25rem;">
-                    {analysis['date']} &bull; {analysis['total_cases']} cases
-                </div>
-            </div>
-            <div style="text-align: right;">
-                <div style="color: {health_color}; font-size: 1.5rem; font-weight: 700;">
-                    {health:.0f}
-                </div>
-                <div style="color: {health_color}; font-size: 0.75rem;">
-                    {health_status}
+                <div style="text-align: right;">
+                    <div style="color: {card_color}; font-size: 1.2rem; font-weight: 700;">
+                        {fully_linked}/{total_orders}
+                    </div>
+                    <div style="color: {COLORS['text_muted']}; font-size: 0.75rem;">
+                        linked orders
+                    </div>
                 </div>
             </div>
         </div>
-    </div>
-    """, unsafe_allow_html=True)
+        """, unsafe_allow_html=True)
 
-    if st.button("View Dashboard", key=f"view_{index}", use_container_width=True):
-        st.session_state["analysis_folder"] = analysis["folder"]
-        st.session_state["analysis_data"] = load_analysis_data(analysis["folder"])
-        st.switch_page("pages/1_Overview.py")
+        if st.button("View Full Dashboard", key=f"view_{index}", use_container_width=True):
+            st.session_state["analysis_folder"] = analysis["folder"]
+            st.session_state["analysis_data"] = load_analysis_data(analysis["folder"])
+            st.switch_page("pages/6_Opportunities.py")
+    else:
+        # Traditional single-source analysis card
+        health = analysis['health_score']
+        health_color = get_health_color(health)
+        health_status = get_health_status(health)
+
+        st.markdown(f"""
+        <div style="background: {COLORS['surface']}; padding: 1rem; border-radius: 8px;
+                    border-left: 3px solid {health_color}; margin-bottom: 0.75rem;">
+            <div style="display: flex; justify-content: space-between; align-items: flex-start;">
+                <div>
+                    <div style="color: {COLORS['white']}; font-weight: 600; font-size: 1.1rem;">
+                        {analysis['account']}
+                    </div>
+                    <div style="color: {COLORS['text_muted']}; font-size: 0.85rem; margin-top: 0.25rem;">
+                        {analysis['date']} &bull; {analysis['total_cases']} cases
+                    </div>
+                </div>
+                <div style="text-align: right;">
+                    <div style="color: {health_color}; font-size: 1.5rem; font-weight: 700;">
+                        {health:.0f}
+                    </div>
+                    <div style="color: {health_color}; font-size: 0.75rem;">
+                        {health_status}
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        if st.button("View Dashboard", key=f"view_{index}", use_container_width=True):
+            st.session_state["analysis_folder"] = analysis["folder"]
+            st.session_state["analysis_data"] = load_analysis_data(analysis["folder"])
+            st.switch_page("pages/1_Overview.py")
 
 
 # Page configuration

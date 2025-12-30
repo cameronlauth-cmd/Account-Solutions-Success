@@ -15,7 +15,7 @@ import click
 from rich.console import Console
 
 from .core import Config
-from .main import run_analysis
+from .main import run_analysis, run_full_analysis
 
 
 console = Console()
@@ -66,6 +66,83 @@ def analyze(input_file: str, output: str, skip_sonnet: bool):
             console.print(f"  Health Score: {result['health_score']:.0f}/100")
             console.print(f"  Total Cases: {result['total_cases']}")
             console.print(f"  Critical Cases: {result['critical_cases']}")
+            console.print(f"  Analysis Time: {result['analysis_time']:.1f}s")
+            console.print()
+            console.print(f"[dim]Output saved to: {result['output_dir']}[/dim]")
+        else:
+            console.print(f"[red]Analysis failed: {result.get('error', 'Unknown error')}[/red]")
+            sys.exit(1)
+
+    except Exception as e:
+        console.print(f"[red]Error: {str(e)}[/red]")
+        sys.exit(1)
+
+
+@cli.command('analyze-full')
+@click.option('--opportunities', '-o', default=None, help='Path to Opportunities Excel file (glob pattern allowed)')
+@click.option('--deployments', '-d', default=None, help='Path to Deployments Excel file (glob pattern allowed)')
+@click.option('--support', '-s', default=None, help='Path to Support Cases Excel file (glob pattern allowed)')
+@click.option('--output', default=None, help='Output directory (default: outputs/)')
+@click.option('--quick', is_flag=True, help='Skip all AI analysis (fastest, for testing)')
+@click.option('--skip-sonnet', is_flag=True, help='Skip Sonnet analysis (faster, cheaper)')
+def analyze_full(opportunities: str, deployments: str, support: str, output: str, quick: bool, skip_sonnet: bool):
+    """
+    Run full 4-layer analysis across all data sources.
+
+    This command orchestrates the complete analysis pipeline:
+    - Load Opportunities, Deployments, and Support Cases
+    - Link data via Order Number
+    - Run 4-layer AI analysis
+    - Calculate multi-dimensional metrics
+    - Generate JSON outputs
+
+    Example:
+        python -m src.cli analyze-full \\
+            --opportunities "input/Ai Opportunities*.xlsx" \\
+            --deployments "input/PS Deploy*.xlsx" \\
+            --support "input/Account AI Email Body*.xlsx"
+
+    Quick test mode (no AI):
+        python -m src.cli analyze-full --quick \\
+            --support "input/cases.xlsx"
+    """
+    # Validate that at least one source is provided
+    if not opportunities and not deployments and not support:
+        console.print("[red]Error: At least one data source must be provided[/red]")
+        console.print("[dim]Use --opportunities, --deployments, or --support[/dim]")
+        sys.exit(1)
+
+    console.print(f"[bold]Account Solutions Full Analysis[/bold]")
+    console.print()
+    console.print("[dim]Data Sources:[/dim]")
+    console.print(f"  Opportunities: {opportunities or 'Not provided'}")
+    console.print(f"  Deployments: {deployments or 'Not provided'}")
+    console.print(f"  Support Cases: {support or 'Not provided'}")
+    console.print(f"[dim]Output directory: {output or 'outputs/'}[/dim]")
+    if quick:
+        console.print(f"[yellow]Quick mode: Skipping all AI analysis[/yellow]")
+    elif skip_sonnet:
+        console.print(f"[yellow]Skipping Claude Sonnet analysis (--skip-sonnet)[/yellow]")
+    console.print()
+
+    try:
+        result = run_full_analysis(
+            opportunities_path=opportunities,
+            deployments_path=deployments,
+            support_path=support,
+            output_dir=output,
+            skip_ai=quick,
+            skip_sonnet=skip_sonnet,
+        )
+
+        if result["success"]:
+            console.print()
+            console.print(f"[green bold]Success![/green bold]")
+            console.print(f"  Opportunities Analyzed: {result['opportunities_analyzed']}")
+            console.print(f"  Deployments Analyzed: {result['deployments_analyzed']}")
+            console.print(f"  Support Cases Analyzed: {result['cases_analyzed']}")
+            console.print(f"  Orders Linked: {result['linked_orders']}")
+            console.print(f"  Fully Linked Orders: {result['fully_linked_orders']}")
             console.print(f"  Analysis Time: {result['analysis_time']:.1f}s")
             console.print()
             console.print(f"[dim]Output saved to: {result['output_dir']}[/dim]")
